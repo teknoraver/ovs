@@ -1180,6 +1180,42 @@ check_trunc_action(struct dpif_backer *backer)
     return !error;
 }
 
+/* Tests whether 'dpif' datapath supports decrement of the IP TTL via
+ * OVS_ACTION_DEC_TTL. */
+static bool
+check_dec_ttl_action(struct dpif *dpif)
+{
+    uint8_t actbuf[NL_A_FLAG_SIZE];
+    struct odputil_keybuf keybuf;
+    struct flow flow = { 0 };
+    struct ofpbuf actions;
+    struct ofpbuf key;
+    bool supported;
+
+    struct odp_flow_key_parms odp_parms = {
+        .flow = &flow,
+        .probe = true,
+    };
+
+    ofpbuf_use_stack(&key, &keybuf, sizeof keybuf);
+    odp_flow_key_from_flow(&odp_parms, &key);
+
+    ofpbuf_use_stack(&actions, &actbuf, sizeof actbuf);
+    nl_msg_put_flag(&actions, OVS_ACTION_ATTR_DEC_TTL);
+
+    supported = dpif_probe_feature(dpif, "dec_ttl", &key, &actions, NULL);
+
+    if (supported) {
+        VLOG_INFO("%s: Datapath supports dec_ttl action",
+                  dpif_name(dpif));
+    } else {
+        VLOG_INFO("%s: Datapath does not support dec_ttl action",
+                  dpif_name(dpif));
+    }
+
+    return supported;
+}
+
 /* Tests whether 'backer''s datapath supports the clone action
  * OVS_ACTION_ATTR_CLONE.   */
 static bool
@@ -1582,6 +1618,7 @@ check_support(struct dpif_backer *backer)
     backer->rt_support.ct_timeout = check_ct_timeout_policy(backer);
     backer->rt_support.explicit_drop_action =
         dpif_supports_explicit_drop_action(backer->dpif);
+    backer->rt_support.dec_ttl_action = check_dec_ttl_action(backer->dpif);
 
     /* Flow fields. */
     backer->rt_support.odp.ct_state = check_ct_state(backer);

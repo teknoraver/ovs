@@ -716,7 +716,57 @@ odp_execute_sample(void *dp, struct dp_packet *packet, bool steal,
     }
     dp_packet_batch_init_packet(&pb, packet);
     odp_execute_actions(dp, &pb, true, nl_attr_get(subactions),
-                        nl_attr_get_size(subactions), dp_execute_action);
+                        nl_attr_get_size(subactions), dp_execute_action, false);
+}
+
+static bool execute_dec_ttl(struct dp_packet *packet)
+{
+    struct eth_header *eth = dp_packet_eth(packet);
+
+    if (dl_type_is_ipv4(eth->eth_type)) {
+        struct ip_header *nh = dp_packet_l3(packet);
+        uint8_t old_ttl = nh->ip_ttl;
+
+        if (old_ttl <= 1) {
+            return true;
+        }
+
+        nh->ip_ttl--;
+        nh->ip_csum = recalc_csum16(nh->ip_csum, htons(old_ttl << 8),
+                                    htons(nh->ip_ttl << 8));
+    } else if (dl_type_is_ipv6(eth->eth_type)) {
+        struct ovs_16aligned_ip6_hdr *nh = dp_packet_l3(packet);
+
+        if (nh->ip6_hlim <= 1) {
+            return true;
+        }
+
+        nh->ip6_hlim--;
+    }
+
+    return false;
+}
+
+static void odp_dec_ttl_exception_handler(void *dp,
+                                          struct dp_packet_batch *batch,
+                                          const struct nlattr *action,
+                                          odp_execute_cb dp_execute_action)
+{
+    const struct nlattr *a;
+    const struct nlattr *subaction = NULL;
+    size_t left;
+
+    if (nl_attr_is_valid(action, nl_attr_get_size(action))) {
+        dp_packet_delete_batch(batch, true);
+        return;
+    }
+
+    NL_NESTED_FOR_EACH_UNSAFE (a, left, action) {
+        subaction = a;
+        odp_execute_actions(dp, batch, true, subaction,
+                            nl_attr_get_size(subaction),
+                            dp_execute_action, true);
+    }
 }
 
 static void
@@ -734,11 +784,11 @@ odp_execute_clone(void *dp, struct dp_packet_batch *batch, bool steal,
         dp_packet_batch_clone(&clone_pkt_batch, batch);
         dp_packet_batch_reset_cutlen(batch);
         odp_execute_actions(dp, &clone_pkt_batch, true, nl_attr_get(actions),
-                        nl_attr_get_size(actions), dp_execute_action);
+                        nl_attr_get_size(actions), dp_execute_action, false);
     }
     else {
         odp_execute_actions(dp, batch, true, nl_attr_get(actions),
-                            nl_attr_get_size(actions), dp_execute_action);
+                            nl_attr_get_size(actions), dp_execute_action, false);
     }
 }
 
@@ -782,7 +832,7 @@ odp_execute_check_pkt_len(void *dp, struct dp_packet *packet, bool steal,
      * odp_execute_actions. */
     dp_packet_batch_init_packet(&pb, packet);
     odp_execute_actions(dp, &pb, true, nl_attr_get(a), nl_attr_get_size(a),
-                        dp_execute_action);
+                        dp_execute_action, false);
 }
 
 static bool
@@ -818,6 +868,7 @@ requires_datapath_assistance(const struct nlattr *a)
     case OVS_ACTION_ATTR_CT_CLEAR:
     case OVS_ACTION_ATTR_CHECK_PKT_LEN:
     case OVS_ACTION_ATTR_DROP:
+    case OVS_ACTION_ATTR_DEC_TTL:
         return false;
 
     case OVS_ACTION_ATTR_UNSPEC:
@@ -844,7 +895,7 @@ requires_datapath_assistance(const struct nlattr *a)
 void
 odp_execute_actions(void *dp, struct dp_packet_batch *batch, bool steal,
                     const struct nlattr *actions, size_t actions_len,
-                    odp_execute_cb dp_execute_action)
+                    odp_execute_cb dp_execute_action, bool force_last)
 {
     struct dp_packet *packet;
     const struct nlattr *a;
@@ -862,7 +913,8 @@ odp_execute_actions(void *dp, struct dp_packet_batch *batch, bool steal,
 
                 dp_execute_action(dp, batch, a, should_steal);
 
-                if (last_action || dp_packet_batch_is_empty(batch)) {
+                if (last_action || dp_packet_batch_is_empty(batch) ||
+                    force_last) {
                     /* We do not need to free the packets.
                      * Either dp_execute_actions() has stolen them
                      * or the batch is freed due to errors. In either
@@ -976,6 +1028,47 @@ odp_execute_actions(void *dp, struct dp_packet_batch *batch, bool steal,
                 return;
             }
             break;
+
+        case OVS_ACTION_ATTR_DEC_TTL: {
+            const size_t cnt = dp_packet_batch_size(batch);
+            struct dp_packet_batch invalid_ttl;
+            bool ttl_valid[NETDEV_MAX_BURST];
+            size_t j, err;
+
+            /* Make batch for invalid ttl packets. */
+            dp_packet_batch_init(&invalid_ttl);
+
+            /* Add packets with ttl <=1 to another batch
+             * set ttl_valid flag to true/false based on TTL. */
+            DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
+                err = execute_dec_ttl(packet);
+                ttl_valid[i] = !err;
+                if (err) {
+                    dp_packet_batch_add(&invalid_ttl, dp_packet_clone(packet));
+                }
+            }
+
+            invalid_ttl.trunc = batch->trunc;
+
+            /* Execute action on packets with ttl <= 1. */
+            if (invalid_ttl.count > 0) {
+                odp_dec_ttl_exception_handler(dp, &invalid_ttl, a, dp_execute_action);
+            }
+
+            /* Rearrange batch for valid ttl cases. */
+            DP_PACKET_BATCH_REFILL_FOR_EACH (j, cnt, packet, batch) {
+                if (ttl_valid[j]) {
+                    dp_packet_batch_refill(batch, packet, j);
+                } else {
+                    dp_packet_delete(packet);
+                }
+            }
+            if (last_action || !batch->count) {
+                /* We do not need to free the packets. */
+                return;
+            }
+            break;
+        }
 
         case OVS_ACTION_ATTR_TRUNC: {
             const struct ovs_action_trunc *trunc =
